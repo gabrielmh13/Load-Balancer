@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -36,7 +37,7 @@ func NewLoadBalancer(urls []string) *LoadBalancer {
 
 		backend.URL = url
 		backend.Proxy = httputil.NewSingleHostReverseProxy(url)
-		backend.Alive = true
+		backend.Alive = isBackendAlive(url)
 
 		lb.Backends = append(lb.Backends, &backend)
 	}
@@ -44,7 +45,7 @@ func NewLoadBalancer(urls []string) *LoadBalancer {
 	return &lb
 }
 
-func (b *Backend) SetAlive(isAlive bool) {
+func (b *Backend) SetBackendAlive(isAlive bool) {
 	b.mux.Lock()
 	defer b.mux.Unlock()
 
@@ -55,17 +56,33 @@ func (lb *LoadBalancer) NextBackend() {
 	lb.Current = (lb.Current + 1) % len(lb.Backends)
 }
 
-func (lb *LoadBalancer) GetBackend() int {
+func (lb *LoadBalancer) GetAliveBackendIndex() (int, error) {
 	lb.mux.Lock()
 	defer lb.mux.Unlock()
-
 	defer lb.NextBackend()
 
-	return lb.Current
+	start := lb.Current
+	for {
+		backend := lb.Backends[lb.Current]
+		if backend.Alive {
+			return lb.Current, nil
+		}
+
+		lb.NextBackend()
+
+		if lb.Current == start {
+			return 0, errors.New("no backends available, try again later")
+		}
+	}
+
 }
 
 func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	backendIndex := lb.GetBackend()
+	backendIndex, err := lb.GetAliveBackendIndex()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 
 	lb.Backends[backendIndex].Proxy.ServeHTTP(w, r)
 	fmt.Printf("Using %s as backend\n", lb.Backends[backendIndex].URL)
@@ -75,7 +92,7 @@ func isBackendAlive(u *url.URL) bool {
 	timeout := 2 * time.Second
 	conn, err := net.DialTimeout("tcp", u.Host, timeout)
 	if err != nil {
-		log.Println("Site unreachable, error: ", err)
+		log.Println("Backend unreachable, error: ", err)
 		return false
 	}
 	defer conn.Close()
@@ -85,16 +102,17 @@ func isBackendAlive(u *url.URL) bool {
 func (lb *LoadBalancer) HealthCheck() {
 	for _, b := range lb.Backends {
 		status := isBackendAlive(b.URL)
-		b.SetAlive(status)
+		b.SetBackendAlive(status)
 	}
 }
 
 func healthCheck(lb *LoadBalancer) {
 	t := time.NewTicker(time.Second * 10)
 	for v := range t.C {
+		fmt.Print("\n\n")
 		log.Printf("Starting health check: " + v.String())
 		lb.HealthCheck()
-		log.Print("Health check completed\n\n")
+		log.Print("Health check completed")
 	}
 }
 
